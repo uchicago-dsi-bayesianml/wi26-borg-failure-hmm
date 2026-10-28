@@ -1,0 +1,15 @@
+# The trace extract is never committed. See data/README.md for how the authors built it.
+# The two small parameter files in data/ are kept on purpose.
+*.parquet
+*.parquet.gz
+data/*
+!data/README.md
+!data/hmm_model_march11.pkl
+!data/norm_params.pkl
+# Editor, OS and Python clutter
+.DS_Store
+.vscode/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.venv/

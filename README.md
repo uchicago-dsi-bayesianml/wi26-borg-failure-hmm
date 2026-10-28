@@ -1,466 +1,195 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.png">
+  <img alt="The University of Chicago, MS in Applied Data Science. ADSP 32014 course project." src=".github/assets/banner-light.png">
+</picture>
+
 # Bayesian Job Failure Prediction in Distributed Systems
 
-> A Bayesian Hidden Markov Model for discovering latent job health states from Google Borg resource telemetry and identifying regimes that are strongly associated with task failure.
+> **Example project from Winter 2026.** This is a copy of [djdhawal/bayesian-failure-prediction-on-cluster-traces](https://github.com/djdhawal/bayesian-failure-prediction-on-cluster-traces), shown with the authors' work and commit history intact. Their own write-up is [REPORT.md](REPORT.md). Course staff wrote this README and made the edits listed under [Changes by course staff](#changes-by-course-staff), including the section on [what to learn from this project](#what-to-learn-from-this-project). The trace data is public under CC BY 4.0 but is not in this repository; the authors' extract lived in a Google Drive folder, and [data/README.md](data/README.md) explains how it was built.
 
-<!-- INSERT HERO FIGURE HERE: one clean summary figure of the project pipeline or state diagram -->
+Tasks on a large cluster rarely die out of nowhere. A task that is about to be killed often spends a while looking different from a task that is working. Can a hidden Markov model recover such states from resource telemetry alone, without ever seeing a failure label, and do the recovered states line up with the failures? The team took one month of Google's 2019 Borg traces, sampled 905 tasks across priority tiers and job outcomes, and fit a three-state Gaussian HMM to five log-transformed usage features by stochastic variational inference in NumPyro, with the hidden states enumerated exactly inside the objective. They then decoded every row with a hand-written forward filter and Viterbi and asked which state tasks were in when they were killed. One state, the one in which the CPU counters read close to zero, holds about four in five kill rows, which the write-up reads as a degraded, pre-failure regime. One teammate also wrote the forward algorithm into the model so that the hidden states are summed out and sampled the parameters with NUTS, and another trained a transformer to forecast decoded states.
 
----
+## Summary
 
-## Overview
+**Data.** Google's ClusterData2019 trace for cell *a*: per-task resource usage in five-minute windows, task lifecycle events and job metadata, read straight from the public Cloud Storage bucket with DuckDB. From 1,200 jobs in three priority bins the team sampled up to 100 tasks per combination of priority bin and job outcome, 905 tasks, and pulled their usage rows: 3.4 million rows, 3.25 million after the modelling notebook drops duplicate timestamps. A task whose last lifecycle event is FAIL or KILL is labelled as such (140 tasks against 765). Tasks are split 80/20 with that label stratified: 724 training tasks and 181 test tasks.
 
-Modern distributed systems generate enormous streams of telemetry, but failure does not usually appear as a single sudden event. In many cases, jobs drift through a sequence of degraded operating conditions before they are killed, evicted, or fail. This project studies that problem using Google Borg cluster traces and models job behavior as a **Bayesian Hidden Markov Model (HMM)**.
+**Features.** Average CPU, the 90th percentile of CPU within the window, average memory, assigned memory, and a burstiness measure (the 90th minus the 10th CPU percentile), each log-transformed after adding 10⁻⁷ and standardized with training-set statistics. Missing values become zero before the log.
 
-Instead of treating each resource measurement independently, we model each job as a **time-ordered sequence** of observations. The HMM learns a small number of latent states that summarize recurring regimes of behavior in the cluster. These states are not manually labeled. They are learned directly from the resource usage data, and then interpreted by examining how they align with downstream failure events.
+**Model.** A Gaussian HMM with three states: Dirichlet(1) priors on the initial distribution and on each row of the transition matrix, Normal(0, 1) priors on the per-state means and Exponential(1) priors on the per-state scales, with the five features independent given the state. The hidden states are enumerated exactly by `TraceEnum_ELBO`, the continuous parameters get a mean-field Gaussian guide, and Adam with gradient clipping and a decaying learning rate runs for 1,000 steps on mini-batches of four tasks, each cut to its first ten windows. Two hundred draws from the fitted guide are averaged into point estimates of the initial distribution, the transition matrix, the means and the scales, which are saved in `data/hmm_model_march11.pkl`.
 
-The final result is a model that separates jobs into distinct usage regimes and shows that one learned state is consistently much more associated with failure than the others. In our validation analysis, **state 1 emerged as the dominant failure-associated state**, suggesting that the model is capturing a meaningful degraded or pre-failure regime rather than only clustering jobs by generic resource intensity.
+**Decoding and validation.** With those point estimates, a NumPy forward filter gives filtered state probabilities for every row and Viterbi gives one hard path per task. A *kill row* is the usage row with the latest start time at or before each FAIL or KILL event of a task. About 80 percent of kill rows decode to state 1, whose means on the CPU features sit close to where a raw zero lands after the log transform. The write-up calls state 1 a degraded or stalled regime and the state most associated with failure.
 
----
+**Side experiments.** `notebooks/MCMC.ipynb` writes the forward algorithm inside the NumPyro model, so the hidden states are summed out and NUTS samples only the continuous parameters; on 20 tasks of 100 windows and four features it converges in under two minutes. `notebooks/Transformer.ipynb` trains a small transformer to predict a task's state 50 windows ahead, using row-wise state labels from an earlier version of the model. Neither appears in the write-up beyond the file listing.
 
-## Problem Statement
+The staff section below explains why the fitted model behaves as a mixture model rather than a sequence model, why the kill-row result is close to circular, what the training loop actually saw, and what the plan promised that was not built.
 
-In a cluster scheduler like Borg, jobs do not all behave the same way:
+## Team and contributions
 
-- some jobs are short-lived and bursty
-- some are stable and well-behaved
-- some gradually become unhealthy before termination
-- some are intentionally killed by users or parent cleanup logic
-- some fail because of system-level or resource-related issues
+Team "Optimus Primes", Winter 2026.
 
-A standard row-wise classifier ignores the temporal path of a job. Two jobs can have similar average utilization overall while having very different trajectories over time. What matters is often not only **how much** CPU or memory is being used, but **how the sequence evolves**.
+- **Dhawal Dixit** ([@djdhawal](https://github.com/djdhawal)): the repository and its first three weeks: the DuckDB loader that reads trace shards from Cloud Storage in parallel, the feature-engineering class, the first NumPyro HMM in `src/modelling.py` (a `scan`-based model in the style of NumPyro's HMM example), `notebooks/pull_data.ipynb`, `notebooks/hmm_model_v01.ipynb`, and the training-loss figure.
+- **Jenitha Patel** ([@jenithapatel](https://github.com/jenithapatel)): the final pipeline in `notebooks/hmm_model_v02.ipynb`, with the train/test split, the kill-row matching, the SVI fit, the NumPy forward filter and Viterbi, and the state analysis; `notebooks/validation.ipynb`; both saved parameter files; the four figures the write-up uses; the `src/` layout; and most of the write-up.
+- **Sameeksha Kini** ([@SameekshaKini](https://github.com/SameekshaKini)): `src/hmm_decoder.py`, an edit to the feature-engineering module, and the write-up's section on SVI.
+- **RJ Xia** ([@rjxia993](https://github.com/rjxia993)): `notebooks/MCMC.ipynb` and `notebooks/Transformer.ipynb`.
+- **Sabayna Ali** ([@sabayna-ali](https://github.com/sabayna-ali)): the first README, on February 26.
 
-This project addresses that issue by asking:
+The repository ran from February 16 to March 13, 2026. The notebooks were saved from Colab and Kaggle, so the account that committed a notebook is not necessarily its only author; the attributions follow the [commit history](https://github.com/uchicago-dsi-bayesianml/wi26-borg-failure-hmm/commits/main).
 
-1. Can we learn latent resource-usage regimes directly from Borg task telemetry?
-2. Do those regimes correspond to meaningful notions of healthy vs degraded execution?
-3. Is there a particular hidden state that becomes overrepresented in failing jobs?
+## Getting started
 
----
+The authors' data extract is not in the repository; the notebooks read it from a Google Drive folder. [data/README.md](data/README.md) explains how it was made and how to rebuild it. The saved model parameters are in the repository, so the decoding and validation steps and the staff check below run without the trace.
 
-## Main Takeaway
+`requirements.txt` pins DuckDB, JAX, NumPy, NumPyro, pandas and regex. The notebooks also use PyArrow, SciPy, scikit-learn, seaborn, matplotlib, Optax and funsor, which NumPyro's enumeration needs; the Transformer notebook needs PyTorch.
 
-The main finding of this project is that the learned latent states are not arbitrary: they map onto interpretable job behaviors.
-
-Across validation, **state 1 is the state most consistently associated with failure**. This state is characterized by suppressed actual usage across several key metrics, which supports the interpretation that it may represent a **degraded, stalled, or underperforming regime** rather than a healthy low-load regime.
-
-Conceptually:
-
-- **State 2** behaves like an active, healthy, high-usage state
-- **State 0** behaves like a lighter or lower-intensity operating state
-- **State 1** behaves like the most failure-associated state and likely represents a latent pre-failure condition
-
-This does **not** mean that low usage itself causes failure. Rather, the model suggests that many failing jobs pass through a regime where resources are allocated but not being used productively, which is consistent with hanging, stalling, waiting, or degraded execution.
-
-<!-- INSERT KEY VALIDATION FIGURE HERE: kill distribution by viterbi state -->
-<!-- INSERT STATE INTERPRETATION FIGURE HERE: average resource usage by state -->
-
----
-
-## Dataset
-
-This project uses the **Google Borg Cluster Traces v3 (ClusterData2019)** dataset, which contains one month of production workload traces from Borg-managed clusters.
-
-We focus on the following tables:
-
-### 1. `instance_usage`
-
-This is the core modeling table. It contains per-instance resource measurements at regular time intervals. These measurements form the observation sequences for the HMM.
-
-### 2. `instance_events`
-
-This table records lifecycle events such as task creation, termination, failure, kill, and similar outcomes. We use these events for **evaluation and interpretation**, not as direct model inputs.
-
-### 3. `collection_events`
-
-This table contains job-level metadata used for contextual grouping and filtering.
-
-The overall modeling philosophy is important:
-
-- the HMM is trained on **resource behavior**
-- event outcomes are used later to ask whether the learned hidden states are predictive or failure-associated
-
-This keeps the latent-state discovery step unsupervised with respect to the final outcome labels.
-
----
-
-## Repository Structure
-
-```text
-bayesian-failure-prediction-on-cluster-traces/
-│
-├── data/                  # model and parameter files used as inputs for validation
-│   ├── hmm_model_march11.pkl
-│   └── norms_params.pkl
-├── notebooks/             # end-to-end exploratory and modeling notebooks
-│   ├── MCMC.ipynb
-│   ├── Transformer.ipynb
-│   ├── hmm_model_v01.ipynb
-│   ├── hmm_model_v02.ipynb
-│   ├── pull_data.ipynb
-│   └── validation.ipynb
-├── figures/               # saved plots
-│   ├── average_resource_utilization_by_viterbi_state.png
-│   ├── log_normed_features_with_priors.jpeg
-│   ├── selected_feature_correlation_heatmap.png
-│   ├── training-loss-march03.png
-│   └── transitions_into_kill_rows_viterbi.png
-├── src/                   # modularized helper code
-│   ├── data_loader.py
-│   ├── data_cleaning.py
-│   ├── hmm_decoder.py
-│   └── modelling.py
-├── requirements.txt
-└── README.md
+```sh
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt pyarrow scipy scikit-learn seaborn matplotlib optax funsor jupyter
 ```
 
+**The pipeline.**
 
-## End-to-End Pipeline
+1. `notebooks/pull_data.ipynb` samples tasks and pulls their usage rows from the public bucket. See the data note for what its recorded run covered.
+2. `notebooks/hmm_model_v02.ipynb` is the whole project in one notebook: cleaning, labels, the split, features, the SVI fit, decoding, the kill-row analysis and the figures. Set `path` in the first cells to the folder holding the two Parquet extracts.
+3. `notebooks/validation.ipynb` reloads `data/hmm_model_march11.pkl` and `data/norm_params.pkl` and repeats the decoding and the kill-row tables over the whole extract.
 
-This section explains the workflow from raw trace data to final decoded states.
+**Staff check.** `staff/check_row_argmax.py` loads the saved parameters with an unpickler that admits only NumPy types, prints the transition matrix and the state profiles, and simulates sequences from the fitted HMM to measure how often the forward filter and Viterbi disagree with a row-by-row classification that ignores the dynamics. It needs only NumPy:
 
-### Step 1: Load the trace data
+```sh
+python staff/check_row_argmax.py
+```
 
-The project begins by loading resource usage and event data from parquet files. Because the underlying files are large, the workflow includes memory-conscious loading patterns such as selective reads and batch-based reading.
+**What does not run as committed.** Nothing under `src/` is imported by any notebook; the notebooks carry their own copies of the same functions. `src/hmm_decoder.py` has an indentation error at line 147 and its methods lack `self` and imports, so it cannot be imported. In `src/data_cleaning.py` the number pattern is a plain string rather than a compiled regex, so the percentile parser fails, and two methods lack `self`. `notebooks/MCMC.ipynb` uses names (`iu_sorted`, `mcmc_mu`, `colors`) that no surviving cell defines, so it needs small repairs before it runs top to bottom. `notebooks/hmm_model_v01.ipynb` is the abandoned first pipeline.
 
-The main training notebook reads `instance_usage` as the starting observation table and also loads `instance_events` for later matching and validation.
+## Data
 
-### Step 2: Remove duplicates
+The trace extract is never committed; `.gitignore` excludes Parquet files and everything in `data/` except the two parameter files and the data note.
 
-Before modeling, duplicate rows are removed to avoid double-counting the same job-time observation.
+- **Source:** [Google ClusterData2019](https://github.com/google/cluster-data/blob/master/ClusterData2019.md) (Tirmazi et al., "Borg: the Next Generation", EuroSys 2020), one month of traces from eight Borg cells. The team used cell *a* and three tables: `instance_usage` (resource measurements in five-minute windows; more than 12,000 Parquet shards for this cell), `instance_events` (lifecycle events; EVICT is type 4, FAIL 5, KILL 7) and `collection_events` (job metadata including priority).
+- **Terms:** CC BY 4.0. Cite the trace and the paper.
+- **The extract:** 1,200 jobs with a priority bin and an outcome, from a table built outside the repository; lifecycle events for those jobs from the first ten event shards; a stratified sample of up to 100 tasks per outcome and priority bin, 905 tasks; and their usage rows. The recorded run of the pull notebook reads 500 of the usage shards and finds rows for 712 tasks; the extract the modelling notebooks load has all 905 tasks and 3,436,845 rows, so a larger pull was made later and not recorded. Because shards are not organized by task or time, a partial pull leaves each task a sparse sample of its windows: in the recorded run the median task had about 94 minutes between consecutive rows.
+- **Labels:** last event FAIL or KILL, 140 of 905 tasks. Kill rows: 4,036 of 3.25 million rows, 3,041 in the training tasks and 995 in the test tasks. A user's kill, a cleanup kill by a parent job and a system kill are not told apart.
+- **Crash loops:** the tasks with the most rows (97,593, 67,259 and 66,760 at the top) all ended in FAIL or KILL and have rows seconds apart, tasks restarted again and again. A few of them hold a large share of all rows.
 
-Examples of duplicate handling include:
+## Project structure
 
-- removing duplicates from `instance_usage` using keys like collection, instance, and start time
-- removing duplicates from `instance_events` using collection, instance, and event time
+| Path | Contents |
+|---|---|
+| `REPORT.md` | The authors' write-up: problem, dataset, pipeline, model, interpretation, validation, limitations, future work. |
+| `notebooks/pull_data.ipynb` | Sampling tasks by priority bin and outcome and pulling their events and usage rows from the bucket with DuckDB. |
+| `notebooks/hmm_model_v02.ipynb` | The final pipeline: cleaning, labels, split, features, the NumPyro SVI fit, forward filter and Viterbi, kill-row analysis, figures, saving the parameters. |
+| `notebooks/validation.ipynb` | Reloads the saved parameters and repeats the decoding and kill-row tables over the whole extract. |
+| `notebooks/hmm_model_v01.ipynb` | The first pipeline, built on `src/modelling.py`: 200-window sequences, 15,000 SVI steps. Abandoned after it collapsed to one state. |
+| `notebooks/MCMC.ipynb` | The marginalized HMM sampled with NUTS on 20 tasks. |
+| `notebooks/Transformer.ipynb` | A transformer that forecasts row-wise state labels 50 windows ahead, run on Kaggle. |
+| `src/data_loader.py` | The parallel DuckDB loader for the trace shards, as a class. |
+| `src/data_cleaning.py` | Feature engineering: percentile parsing, burstiness, tail features, log-normalization. Not importable as is. |
+| `src/modelling.py` | The first HMM, a `scan`-based NumPyro model with enumeration, and its SVI setup. |
+| `src/hmm_decoder.py` | Forward filter and Viterbi as a class. Does not parse. |
+| `data/hmm_model_march11.pkl`, `data/norm_params.pkl` | The saved point estimates and the normalization statistics. See `data/README.md`. |
+| `figures/` | The feature distributions against the prior, the feature correlation heatmap, average usage by decoded state, transitions into kill rows, and the training loss of an early run of the first pipeline. |
+| `staff/check_row_argmax.py` | Course staff's check of how much the dynamics matter, described above. |
 
-This is an important quality-control step because HMMs are sequence models. Duplicate records would distort both transition behavior and emission estimates.
+## Method
 
-### Step 3: Clean types and reduce memory pressure
+**Preprocessing.** Usage rows are de-duplicated on task and start time, and events on task and event time. The CPU usage percentile distribution of each window is parsed into eleven percentile columns and a burstiness column; the tail distribution into mean, maximum, 90th percentile and non-zero fraction. Each task's last event sets its label. Tasks are split 80/20, stratified on the label, and the split is checked for overlap. Eleven usage columns are filled with zero where missing, log-transformed with an offset of 10⁻⁷ and standardized with the training tasks' mean and standard deviation; five of them are the model's features. Each task's rows are sorted by start time into one sequence.
 
-Several columns are downcast or reformatted to make the dataset easier to work with. This matters because the project deals with large-scale trace data, and preprocessing must remain computationally feasible.
+**Model.** For a task with windows *t* = 1, …, *T* and five-dimensional observations *x*ₜ,
 
-### Step 4: Engineer modeling features
+> *z*₁ ~ Categorical(π), *z*ₜ | *z*ₜ₋₁ ~ Categorical(A[*z*ₜ₋₁]), *x*ₜ | *z*ₜ ~ Normal(μ[*z*ₜ], σ[*z*ₜ]) independently per feature,
 
-The project does not feed raw event labels into the model. Instead, it constructs a compact feature set summarizing resource behavior.
+with π ~ Dirichlet(1, 1, 1), each row of A ~ Dirichlet(1, 1, 1), μ ~ Normal(0, 1) and σ ~ Exponential(1) elementwise. The number of states is fixed at three.
 
-The final modeling features are:
+**Inference.** The hidden states are declared with `infer={"enumerate": "parallel"}` and hidden from the guide with `handlers.block`, so `TraceEnum_ELBO` sums them out exactly at every step while an `AutoNormal` guide places independent Gaussians on π, A, μ and σ in unconstrained space. Each step draws four training tasks at random, truncates each to its first ten windows, pads shorter ones and masks the padding. Optax's Adam at 0.005 with the rate halving every 1,000 steps and gradients clipped at global norm 5 runs for 1,000 steps; the loss on a batch falls from about 310 to between 165 and 180 and is noisy throughout. Afterwards 200 draws from the guide are averaged to point estimates. The notebook's own timing note says 21 minutes.
 
-- `average_usage_cpus_logged_normed`
-- `average_usage_memory_logged_normed`
-- `assigned_memory_logged_normed`
-- `cpu_p90_logged_normed`
-- `cpu_burstiness_logged_normed`
+**Decoding.** The forward filter runs in log space with normalization at every step and returns P(*z*ₜ | *x*₁..ₜ); its argmax is the "dominant forward state". Viterbi returns the most likely path. Both are plain NumPy and are applied to every task's full sequence of rows, except that the training-set state summary in the notebook caps sequences at 500 windows.
 
-These features were selected because they capture complementary aspects of job behavior:
+**The NUTS variant.** The same emissions, a sticky Dirichlet(0.9 I + 0.1) prior on the transition rows and no initial distribution, with the forward algorithm written in `lax.scan` inside the model and the summed log-likelihood added through `numpyro.factor`. Twenty tasks with at least 100 windows, their first 100 windows, four raw usage features standardized per task. NUTS with 500 warmup and 1,000 draws, one chain, runs in about a minute and a half on CPU with R-hat 1.00 and effective sample sizes near 900. The notebook notes that 64 tasks gave R-hat above 1.1.
 
-- **average CPU usage** captures sustained compute load
-- **average memory usage** captures sustained memory demand
-- **assigned memory** captures the requested allocation or resource envelope
-- **CPU p90** captures upper-tail CPU pressure
-- **CPU burstiness** captures spikiness or instability in CPU demand
+**The transformer.** State labels come from an earlier eleven-feature model dated March 8, assigned row by row as the state with the highest emission likelihood, with no dynamics. A two-layer encoder with 64-dimensional embeddings and four heads reads 50 windows and predicts the label 50 windows later. It trains for 30 epochs on a 20 percent subsample, 661,268 training windows and 19,203 test windows from a task-level 80/20 split.
 
-Together, these features give the model a view of both average behavior and stress behavior.
+### What is Bayesian here
 
-![Normalized feature distributions compared with prior](figures/log_normed_features_with_priors.jpeg)
+The HMM puts priors on every continuous parameter, and the hidden states are integrated out exactly: by enumeration in the SVI model, by the forward algorithm written into the NUTS model. That is the evaluation problem of the course's HMM sessions, implemented twice. Stochastic variational inference with a mean-field Gaussian guide then approximates the posterior over π, A, μ and σ by maximizing the evidence lower bound, and NUTS samples the same kind of posterior in the second notebook. The forward filter and Viterbi used for decoding are the filtering and decoding problems of the course, run with fixed parameters.
 
-*Figure: Distributions of the five final normalized modeling features compared against the standard normal prior used in the Bayesian HMM. This plot shows that after log transformation and normalization, the features are placed on a more comparable scale for modeling, while still retaining meaningful structure such as skewness, multimodality, and concentration in different regions of the feature space.*
+What stops short of the plan: the posterior is collapsed to its mean right after fitting, so none of the decoded probabilities, kill-row tables or figures carries any parameter uncertainty, and the filtered probabilities are uncertainty about the state given one fixed parameter set. The methodology document promised credible intervals that would tell "migrate the task now" from "wait and watch"; no interval appears in the results. The mini-batch objective is not scaled up to the size of the data, so the guide approximates the posterior one would get from 40 windows, with the priors weighing accordingly. There is no posterior predictive check and no held-out likelihood, and the planned comparison of two to five states by ELBO and WAIC was not run. The NUTS notebook is the one place where posterior spread is reported, as 5 and 95 percent quantiles of the state means.
 
-![Correlation heatmap of selected modeling features](figures/selected_feature_correlation_heatmap.png)
+## Results
 
-*Figure: Correlation heatmap for the final selected modeling features used in the HMM. The selected set preserves key information about CPU load, memory usage, allocation, and burstiness while avoiding an overly redundant input space.*
-### Step 5: Apply transformations and normalization
+**The fitted model.** From `data/hmm_model_march11.pkl`. The initial distribution is (0.30, 0.30, 0.40).
 
-Because raw cluster telemetry can be highly skewed, the project applies transformations to make the feature space more stable for Gaussian emissions.
+| From \ to | State 0 | State 1 | State 2 |
+|---|---:|---:|---:|
+| State 0 | 0.29 | 0.29 | 0.42 |
+| State 1 | 0.19 | 0.41 | 0.40 |
+| State 2 | 0.11 | 0.14 | 0.75 |
 
-This includes:
+Expected dwell times are 1.4, 1.7 and 4.1 windows; the stationary distribution is (0.15, 0.22, 0.62).
 
-- log-based transformations
-- normalization using learned parameters
-- carrying normalization parameters forward so the exact same transformation can be applied during validation
+**State profiles.** Emission means in standardized log units, with the value a raw zero takes after the transform for comparison.
 
-This is critical. The validation dataset must be normalized with the same statistics and transformation logic as the training data, otherwise the decoded states would not be comparable.
+| Feature | State 0 | State 1 | State 2 | Raw zero |
+|---|---:|---:|---:|---:|
+| Average CPU | −0.69 | −0.94 | 0.74 | −1.44 |
+| CPU 90th percentile | −0.58 | −1.06 | 0.79 | −1.34 |
+| Average memory | −0.67 | −0.73 | 0.74 | −2.46 |
+| Assigned memory | 0.03 | −0.08 | 0.45 | −5.92 |
+| CPU burstiness | −0.67 | −1.12 | 0.82 | −1.23 |
 
-### Step 6: Construct time-ordered sequences
+State 2 has scales of 0.36 to 0.66; state 1 has 0.46 to 1.03; state 0 has 0.76 to 1.27 and overlaps state 1 heavily.
 
-The HMM requires ordered observation sequences. After cleaning and feature preparation, rows are grouped into per-job or per-instance sequences and sorted by time.
+**Kill rows by decoded state.** The write-up's tables come from `validation.ipynb`, which decodes the whole extract, training tasks included. The training notebook gives the split numbers.
 
-At this stage, each sequence becomes:
+| Share of kill rows in … | State 0 | State 1 | State 2 |
+|---|---:|---:|---:|
+| Whole extract, forward state | 12.9% | 78.0% | 9.1% |
+| Whole extract, Viterbi | 10.3% | 80.8% | 8.9% |
+| Training tasks, forward state | 14.3% | 75.8% | 9.9% |
+| Test tasks, forward state | 8.9% | 85.1% | 5.9% |
+| Test tasks, Viterbi | 5.4% | 88.7% | 5.8% |
 
-- one entity evolving over time
-- a matrix of observations
-- the input to the latent-state model
+**What the write-up leaves out.** Both notebooks also compute the base rates and the per-row kill rate; whole extract, forward state.
 
-### Step 7: Train the Bayesian HMM with SVI
+| | State 0 | State 1 | State 2 |
+|---|---:|---:|---:|
+| Share of all rows | 8.2% | 39.3% | 52.4% |
+| Share of kill rows ÷ share of all rows | 1.57 | 1.98 | 0.17 |
+| Kill rows per 1,000 rows in the state | 1.8 | 2.3 | 0.2 |
 
-The model is implemented in **NumPyro** using **JAX**, with **Stochastic Variational Inference (SVI)** used for fitting.
+In the window before a kill, the Viterbi state on the training tasks is 0, 1 or 2 for 10.5, 65.7 and 23.8 percent of kills, against 8.7, 35.9 and 55.4 percent of all rows. Of kills whose previous window was in state 2, 78 percent are in state 1 at the kill row itself.
 
-The HMM learns:
-- initial state probabilities (π)
-- transition probabilities between states (prob_z)
-- Gaussian emission parameters (μ, σ) for each state
+**NUTS.** Posterior means of the four state means are tightly estimated (standard deviations of 0.01 to 0.04 on standardized features) and the chain is clean. The figure of state separation was saved to the authors' Drive and is not in the repository.
 
-The state space is fixed to **3 latent states** in the final version.
+**Transformer.** Accuracy 0.62 on the test windows, of which 58 percent carry the majority label. Recall is 0.99 on state 1 and 0.09 and 0.12 on the other two: the model predicts state 1 almost regardless of input. The saved results file lists 15 epochs; the training loop ran 30.
 
-#### Why SVI?
+**The first pipeline.** `hmm_model_v01.ipynb` fit the `src/modelling.py` model on 76 windows of 200 rows for 15,000 steps. It put 96 percent of rows in one state and learned three identical transition rows, which is why it was abandoned. The committed training-loss figure, 15,000 steps from 1.8 × 10⁷ down to 1.7 × 10⁶, is from a run of that pipeline on March 3, not of the final model.
 
-Exact Bayesian inference over HMM parameters is computationally infeasible at this scale — 724 training sequences with a mean length of 267 timesteps, some stretching to 300,000 timesteps. MCMC would require running many chains across the full dataset. SVI instead approximates the posterior by maximizing the **Evidence Lower Bound (ELBO)**, making inference tractable.
+## What to learn from this project
 
-#### Implementation Details
+Course staff added this section. The pipeline is a substantial piece of work; the points below are about what its results can and cannot support.
 
-- **Guide:** `AutoNormal`: a diagonal Gaussian variational distribution over all continuous parameters (π, prob_z, μ, σ). Each parameter gets its own learned mean and variance.
-- **Loss:** `TraceEnum_ELBO`: this is the key detail. Because HMMs have discrete latent states `z`, we use `handlers.block` to hide those states from the guide and let `TraceEnum_ELBO` enumerate (marginalize) over them exactly. This avoids the variance problems of trying to treat discrete variables as continuous.
-- **Optimizer:** Adam with exponential learning rate decay and gradient clipping via Optax.
-- **Mini-batching:** Rather than feeding full sequences at once, training uses fixed windows of 10 timesteps. This prevents JAX from retracing the computation graph on variable-length inputs and keeps memory usage manageable.
-- **Training:** 1,000 steps. ELBO drops from ~310 to ~165–180, indicating the variational posterior is converging.
+- **Check whether your sequence model is using the sequence.** The fitted transition matrix is barely sticky: 0.29, 0.41 and 0.75 on the diagonal, so a task is expected to stay in a state for one to four windows. Meanwhile the emission log-likelihood of a row differs between states by tens of nats, while the largest transition penalty is 2.2 nats. The filtered state at a row is therefore the state whose emission distribution fits that row, and the dynamics almost never override it. On sequences simulated from the fitted model itself, the staff script finds the forward filter agreeing with a row-by-row classification on 98 percent of rows and Viterbi on 98 percent; with the same emissions and a sticky transition matrix, Viterbi recovers 98 percent of the simulated states where the row-by-row classification gets 87 percent, which is what a sequence model earning its keep looks like. A three-component Gaussian mixture would have produced the same states. The fix is not to drop the HMM but to look at its transition matrix before interpreting the states as regimes, and to compare it with the mixture.
+- **Know what your states are.** State 1's means on the three CPU features sit a fraction of a standard deviation above where a raw zero lands after log(x + 10⁻⁷), with assigned memory near average. State 1 is "the CPU counters read zero or nearly so while memory stays assigned", and the spike at that position is visible in the write-up's own histogram figure. The authors' reading, resources allocated but idle, is right; "a degraded regime the model discovered" overstates what a mixture component on log-usage can know.
+- **Beware validation that scores the label's own footprint.** A kill row is the window in which the task died, and usage in that window is low because the task stopped. That it decodes to the low-usage state is nearly guaranteed by the definition. The transitions figure shows it: of kills reached from the high-usage state, 78 percent are in state 1 at the kill row, so the state flips at the moment of death rather than before it. Prediction means scoring the state at a fixed lead time before the event, on held-out tasks, against an honest baseline such as "is CPU usage zero".
+- **Report the numbers that cut against the headline.** The notebooks compute the base rates, the lift and the per-row kill rate; the write-up shows only the share of kill rows per state. State 1 holds 39 percent of all rows, so its 78 percent of kill rows is a lift of about two; state 0 has a lift of 1.6 and a per-row kill rate within a fifth of state 1's. The defensible finding is the negative one: kills rarely coincide with high-usage rows.
+- **Say what the training loop saw.** Batches of four tasks, truncated to their first ten windows, for 1,000 steps: about 7,000 rows out of 2.5 million, all from the first 50 minutes of each task's record, and the mini-batch loss never scaled up to the data. Decoding is then applied to sequences up to 97,593 rows long. Mini-batching an HMM is fine; truncation to the start of every task is a modeling choice, and the write-up presents it as a JAX implementation detail.
+- **Look at the time axis.** The trace measures every five minutes; the recorded pull takes a sparse sample of the shards, and the modelling notebook shows a task whose rows are 25 seconds apart. A single transition matrix over rows whose spacing ranges from seconds to hours has no unit of time. Resample to a grid, or let the transition depend on the gap.
+- **Ship the plan or revise it in writing.** The methodology document promised per-program transition matrices pooled by priority tier, a cycles-per-instruction feature, choosing the number of states by ELBO and WAIC, calibration metrics, and separating parent-cleanup kills from failures. None of it is in the repository, and the repository's description still claimed the hierarchy and the WAIC comparison. The limitations section does admit the label mixing, which is the honest way to handle a dropped plan.
+- **Keep the repository honest and runnable.** The `src/` modules are unused and partly broken, and the write-up calls them "modularized helper code". Four "INSERT FIGURE HERE" comments survive in the README, "300,000 timesteps" where the longest task has 97,593 rows, "regular time intervals", and `norms_params.pkl`. The validation notebook decodes all 905 tasks, training tasks included, and the write-up calls its tables validation. The NUTS notebook, which is the right method for this question at the scale it was run, gets one line in the file listing.
 
-#### Posterior Extraction
+What the project does well: a real production trace and the engineering to work with it, a parallel DuckDB loader over thousands of remote shards and memory-aware Parquet reading; an HMM with exact enumeration inside stochastic variational inference, which few students get working; a forward filter and Viterbi written by hand and correct; a task-level stratified split with a check for leakage; a marginalized HMM under NUTS with convergence diagnostics and a note on when it broke; a long, well-organized write-up with a genuine limitations section; and the question itself, which deserves the better evaluation described above.
 
-After training, 200 samples are drawn from the learned guide (the variational posterior) and averaged to obtain point estimates for π, prob_z, μ, and σ. These become the parameters used in the forward algorithm and Viterbi decoding.
+## About this project
 
-### Step 8: Save learned parameters
+This project was built in Bayesian Machine Learning with Generative AI Applications (ADSP 32014), part of the Master of Science in Applied Data Science at the University of Chicago, in Winter 2026. It is shown here as an example for later cohorts.
 
-After training, the learned model parameters are exported for reuse in downstream decoding. These saved artifacts include items such as:
+## Changes by course staff
 
-- `pi`
-- `A`
-- `mu`
-- `sigma`
-- `features`
-- `K`
-- `norm_params`
+Course staff forked the authors' repository and made these edits. The authors' code is unchanged.
 
-Saving these parameters allows the model to be applied in a separate notebook without retraining.
+- Removed `.DS_Store` and `.vscode/settings.json` and added a `.gitignore` that keeps the trace extract out of the repository while keeping the two parameter files.
+- Added `data/README.md`, on how the extract was built and how to rebuild it, and `staff/check_row_argmax.py`, the check described above.
+- Renamed the authors' README to `REPORT.md`, unchanged, and added this README with the program banner.
 
-### Step 9: Decode hidden states on validation data
+## License
 
-The validation notebook loads the saved parameters and applies:
-
-- the **forward algorithm** for posterior state probabilities over time
-- the **Viterbi algorithm** for the most likely discrete state path
-
-This produces two useful ways to summarize state membership:
-
-1. **dominant forward state**  
-   A probabilistic summary based on posterior state mass.
-
-2. **Viterbi state**  
-   A hard decoded path giving the most likely latent state sequence.
-
-### Step 10: Compare decoded states with failure labels
-
-Once the validation set has decoded hidden states, those states are compared with observed kill/failure outcomes. This is how the project moves from unsupervised latent-state learning to meaningful operational interpretation.
-
----
-
-## Why Hidden Markov Models?
-
-An HMM is a natural fit for this problem because jobs in a distributed system are inherently sequential.
-
-At each time step, we observe resource usage, but the real “health condition” of the job is hidden. The model assumes that:
-
-- each observation is generated from an underlying hidden state
-- the hidden state evolves over time according to transition probabilities
-- the current hidden state influences the observed CPU/memory pattern
-
-This matters more than a static model because failure is often a **trajectory problem**. Jobs do not instantly switch from healthy to failed. They often pass through one or more intermediate regimes.
-
-An HMM captures exactly that:
-
-- persistence of state
-- transitions between regimes
-- noisy observations emitted from hidden conditions
-
----
-
-## Model Interpretation
-
-The hidden states are learned from resource data alone, so their meaning must be inferred after training by examining the average feature values and their association with outcomes.
-
-### State 2: high-usage active regime
-
-State 2 has the highest means across CPU, memory, CPU p90, and burstiness. This looks like the most active operating regime. These jobs are consuming resources and appear to be doing work.
-
-### State 0: lower-intensity regime
-
-State 0 appears to be a lower-load state. It may reflect lighter or less demanding execution, but it does not appear to be the most failure-associated state.
-
-### State 1: degraded / failure-associated regime
-
-State 1 is the most interesting state. It has very low values across multiple actual usage dimensions and emerges as the state most frequently aligned with failure.
-
-A plausible interpretation is that this state corresponds to jobs that have resources allocated but are no longer using them productively. That is consistent with:
-
-- stalling
-- hanging
-- waiting on blocked work
-- degraded execution
-- pre-termination behavior
-
-This interpretation is strengthened by the validation results, where state 1 is overrepresented among kill rows.
-
-<!-- INSERT BAR CHART HERE: average resource usage by state -->
-<!-- INSERT OPTIONAL HEATMAP HERE: state-feature mean heatmap -->
-
-## Validation and Results
-
-The validation notebook asks a practical question:
-
-> once the model has learned latent states, do those states line up with actual failure outcomes?
-
-The answer is yes, especially for state 1.
-
-### Key validation idea
-
-We compare observed kill rows against decoded hidden states using two perspectives:
-
-#### 1. `P(state | kill)`
-
-Among rows that ended in a kill, which hidden state do they belong to most often?
-
-#### 2. `P(kill | state)`
-
-Given a decoded hidden state, how often do rows in that state correspond to kill outcomes?
-
-Together, these two views help distinguish:
-
-- whether a state is common among failures
-- whether being in that state is relatively more dangerous than the alternatives
-
-### Main result
-
-State 1 is the most failure-associated state under both decoding summaries.
-
-This is the central empirical conclusion of the project. The model did not simply cluster jobs by “high” versus “low” usage. Instead, it learned a latent regime that is disproportionately associated with task kills. That regime appears to reflect underproductive or degraded execution rather than healthy low-load activity.
-
-### Why this matters
-
-This is useful because it means the HMM is doing more than compressing the data. It is identifying a hidden operating condition that has operational relevance.
-
-That opens the door to applications such as:
-
-- early warning signals for jobs drifting into unhealthy regimes
-- workload monitoring dashboards based on hidden state occupancy
-- state-based risk scoring over time
-- downstream failure prediction systems that use latent states as features
-
-| Viterbi State | Percent of `kill_row == 1` |
-|---|---:|
-| 0 | 10.282458% |
-| 1 | 80.773043% |
-| 2 | 8.944500% |
-Among rows where `kill_row == 1`, the vast majority are assigned to **Viterbi state 1**. Specifically, about **80.77%** of kill rows fall into state 1, while only **10.28%** fall into state 0 and **8.94%** fall into state 2. This strongly suggests that state 1 is the hidden state most associated with failure and likely captures a degraded or pre-failure job regime.
-
-| Dominant Forward State | Percent of `kill_row == 1` |
-|---|---:|
-| 0 | 12.908821% |
-| 1 | 77.998018% |
-| 2 | 9.093162% |
-Among rows where `kill_row == 1`, most are assigned to **dominant forward state 1**. About **78.00%** of kill rows fall into state 1, compared with **12.91%** in state 0 and **9.09%** in state 2. This supports the same conclusion as the Viterbi decoding results: **state 1 is the hidden state most strongly associated with failure**, which suggests it represents a degraded or pre-failure regime.
-
-![Average resource usage by Viterbi state](figures/average_resource_utilization_by_viterbi_state.png)
-
-**Figure:** Average normalized resource usage across Viterbi states. The model identifies three interpretable job regimes: **State 0** represents a **low-utilization** state with below-average usage across all resource metrics, **State 1** represents an **unhealthy-utilization** state where CPU, memory, and burstiness are especially suppressed and align most strongly with failure, and **State 2** represents a **high-utilization** state with consistently elevated usage across all metrics, corresponding to the most active jobs.
-
-![Transitions into Kill Rows (Viterbi)](figures/transitions_into_kill_rows_viterbi.png)
-
-**Figure:** Transition patterns into kill rows using Viterbi-decoded states. Most kill events occur when the job is already in **state 1**, or after it transitions into **state 1** from another state. In particular, jobs coming from **state 2** move into **state 1** before a kill much more often than into any other state, which reinforces the interpretation of **state 1** as a degraded pre-failure regime.
-
----
-
-## What We Learned
-
-This project led to several important conclusions:
-
-### 1. Temporal structure matters
-
-Failure is not just a property of a single row. It is often the result of a sequence moving through hidden regimes.
-
-### 2. Resource telemetry contains meaningful latent state information
-
-CPU and memory behavior alone are sufficient to recover interpretable job regimes.
-
-### 3. One state consistently concentrates failures
-
-The emergence of a single failure-heavy state suggests that hidden-state modeling can help uncover pre-failure signatures in distributed systems.
-
-### 4. Low productive usage can be as informative as high stress
-
-A failure-associated state does not necessarily have to correspond to maximal utilization. In this project, the strongest failure-associated regime looks more like a degraded execution state than an overload state.
-
----
-
-## Limitations
-
-This project has some limitations:
-
-### 1. State meaning is inferred, not labeled
-
-The hidden states are learned unsupervised. Their interpretation comes from post hoc analysis of feature means and alignment with outcomes.
-
-### 2. Failure labels may mix different mechanisms
-
-Not every termination event has the same meaning. Some kills are intentional, while others reflect system problems. That can blur the mapping between latent state and “true failure.”
-
-### 3. Validation is based on downstream alignment, not a full production alerting benchmark
-
-The project shows that hidden states are informative, but it does not yet implement a complete online forecasting or alerting system.
-
----
-
-## Future Work
-
-### 1. Transition-based early warning
-
-Instead of using only final decoded state membership, detect jobs that are moving **into** state 1 and flag them as elevated risk.
-
-### 2. Time-to-failure analysis
-
-Measure how long before a kill event jobs tend to enter the failure-associated state.
-
-### 3. More explicit sequence-level evaluation
-
-Compare successful and failed jobs by:
-
-- fraction of time spent in each state
-- number of transitions
-- last-state-before-termination
-- transition patterns into the final event
-
-### 4. Stronger modularization
-
-Move the full pipeline from notebook-only logic into clean reusable modules and scripts.
-
-### 5. Hybrid models
-
-Use decoded HMM states as features in a downstream supervised failure-risk model.
-
----
-
-## Conclusion
-
-This project demonstrates that a Bayesian HMM can recover meaningful hidden regimes from Borg resource telemetry and that those regimes have real predictive value for understanding failure.
-
-The most important conclusion is that **state 1 consistently concentrates failure outcomes**, suggesting that the model has identified a degraded latent operating regime rather than merely clustering by raw utilization level.
-
-That makes hidden-state modeling a promising approach for:
-
-- failure analysis
-- temporal workload monitoring
-- pre-failure regime detection
-- sequence-aware observability in large distributed systems
-
-In short, this project shows that cluster failures leave behind temporal structure before the final event, and Bayesian latent-state models can detect that structure.
-
----
-
-## Acknowledgments and References
-
-- Google Borg Cluster Traces / ClusterData2019
-- NumPyro
-- JAX
-- PyArrow
-- Pandas
-- Scikit-learn
-- Matplotlib / Seaborn
-### Course Acknowledgment
-
-This project was completed as part of **ADSP 32014 IP01: Bayesian Machine Learning with Generative AI Applications** at the **University of Chicago** under the guidance of **Professor Batu Gundogdu**.
+The authors have not added a license, so their work is shown here under GitHub's terms for public repositories. Ask them before reusing it. The Borg trace is CC BY 4.0, as above.
